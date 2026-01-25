@@ -88,8 +88,8 @@ USER_CONFIG = {
 # --- 命名元组 ---
 # QQ空间相册对象，包含相册ID, 相册名, 照片数量
 QzoneAlbum = namedtuple("QzoneAlbum", ["uid", "name", "count"])
-# QQ空间照片对象，包含照片链接, 照片名, 所属相册名, 是否为视频
-QzonePhoto = namedtuple("QzonePhoto", ["url", "name", "album_name", "is_video"])
+# QQ空间照片对象，包含照片链接, 照片名, 所属相册名, 是否为视频, 照片唯一标识
+QzonePhoto = namedtuple("QzonePhoto", ["url", "name", "album_name", "is_video", "pic_key"])
 
 
 # --- 工具函数---
@@ -244,9 +244,9 @@ def download_photo_network_helper(
 
 def save_photo_worker(args: tuple) -> None:
     """
-    工作函数，用于下载并保存单张照片。
+    工作函数，用于下载并保存单张照片或视频。
     在线程池中运行。
-    
+
     Args:
         args (tuple): 包含以下元素的元组:
             - session (requests.Session): requests会话对象
@@ -255,8 +255,11 @@ def save_photo_worker(args: tuple) -> None:
             - album_name (str): 相册名称
             - photo_index (int): 照片索引
             - photo (QzonePhoto): 照片对象
+            - qzone_manager (QzonePhotoManager): 管理器实例
+            - album_id (str): 相册ID
+            - dest_user_qq (str): 目标用户QQ
     """
-    session, user_qq, album_index, album_name, photo_index, photo = args
+    session, user_qq, album_index, album_name, photo_index, photo, qzone_manager, album_id, dest_user_qq = args
 
     album_save_path = os.path.join(
         get_save_directory(user_qq), sanitize_filename_component(album_name.strip())
@@ -270,10 +273,26 @@ def save_photo_worker(args: tuple) -> None:
 
     photo_name_sanitized = sanitize_filename_component(photo.name)
     base_filename = f"{photo_index}_{photo_name_sanitized}"
-    if photo.is_video:
-        base_filename = f"{photo_index}_{photo_name_sanitized}_视频缩略图"
 
-    final_filename = f"{base_filename}.jpeg"
+    # 如果是视频，尝试获取真实的视频下载URL
+    download_url = photo.url
+    file_extension = ".jpeg"
+
+    if photo.is_video:
+        print(f"[检测到视频] 正在获取真实视频下载链接: '{photo.name}'")
+
+        # 调用API获取视频下载URL
+        video_url = qzone_manager.get_video_download_url(dest_user_qq, album_id, photo.pic_key)
+
+        if video_url:
+            download_url = video_url
+            file_extension = ".mp4"
+            print(f"[成功] 获取到视频下载链接")
+        else:
+            print(f"[失败] 无法获取视频下载链接，将下载视频封面图代替")
+            base_filename = f"{photo_index}_{photo_name_sanitized}_视频封面"
+
+    final_filename = f"{base_filename}{file_extension}"
     full_photo_path = os.path.join(album_save_path, final_filename)
 
     if not is_path_valid(full_photo_path):
@@ -290,11 +309,12 @@ def save_photo_worker(args: tuple) -> None:
         )
         return
 
-    url = photo.url.replace("\\", "")  # 清理 URL
+    url = download_url.replace("\\", "")  # 清理 URL
     attempts = 0
     current_timeout = APP_CONFIG["timeout_init"]
 
-    print(f"[开始下载] 相册 '{album_name}', 照片 {photo_index + 1} ('{photo.name}')")
+    download_type = "视频" if photo.is_video and file_extension == ".mp4" else "照片"
+    print(f"[开始下载] 相册 '{album_name}', {download_type} {photo_index + 1} ('{photo.name}')")
 
     while attempts < APP_CONFIG["max_attempts"]:
         try:
@@ -364,6 +384,16 @@ class QzonePhotoManager:
         "&skipCmtCount=0&singleurl=1&batchId=&notice=0&appid=4&inCharset=utf-8&outCharset=utf-8"
         "&source=qzone&plat=qzone&outstyle=json&format=jsonp&json_esc=1&question=&answer="
         "&callbackFun=shine0&callback=shine0_Callback"
+    )
+
+    # 获取视频详情的API URL模板
+    VIDEO_DETAIL_URL_TEMPLATE = (
+        "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/"
+        "cgi_floatview_photo_list_v2?g_tk={gtk}&t={t}&topicId={album_id}&picKey={pic_key}"
+        "&shootTime=&cmtOrder=1&fupdate=1&plat=qzone&source=qzone&cmtNum=10&likeNum=5"
+        "&inCharset=utf-8&outCharset=utf-8&callbackFun=viewer&offset=0&number=15"
+        "&uin={user}&hostUin={dest_user}&appid=4&isFirst=1&sortOrder=1&showMode=1"
+        "&need_private_comment=1&prevNum=9&postNum=18"
     )
 
     def __init__(self, user_qq: str, password: str):
@@ -542,20 +572,25 @@ class QzonePhotoManager:
             return {}
 
         text_content = response.text
-        # 清理 JSONP 包装器："shine0_Callback(...);" 或类似格式
+        # 支持多种JSONP回调格式
         if text_content.startswith("shine0_Callback(") and text_content.endswith(");"):
             json_str = text_content[len("shine0_Callback(") : -2]
+        elif text_content.startswith("viewer_Callback(") and text_content.endswith(");"):
+            json_str = text_content[len("viewer_Callback(") : -2]
         elif text_content.startswith("_Callback(") and text_content.endswith(");"):
-            # 某些 API 可能使用此格式
             json_str = text_content[len("_Callback(") : -2]
         else:
-            # 如果没有已知的包装器，则尝试直接解析；如果看起来像错误，则记录日志
-            if APP_CONFIG["is_api_debug"]:
-                # 记录内容开头部分
-                print(
-                    f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
-                )
-            json_str = text_content  # 假设它可能是纯 JSON
+            # 尝试使用正则表达式匹配任意回调函数名
+            import re
+            match = re.match(r'^\w+_Callback\((.*)\);?$', text_content, re.DOTALL)
+            if match:
+                json_str = match.group(1)
+            else:
+                if APP_CONFIG["is_api_debug"]:
+                    print(
+                        f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
+                    )
+                json_str = text_content
 
         try:
             return json.loads(json_str)
@@ -564,6 +599,90 @@ class QzonePhotoManager:
             if APP_CONFIG["is_api_debug"]:
                 print(f"有问题的完整 JSON 字符串: {json_str}")
             return {}
+
+    def get_video_download_url(self, dest_user_qq: str, album_id: str, pic_key: str) -> str:
+        """
+        获取视频的真实下载URL。
+
+        Args:
+            dest_user_qq (str): 目标用户的QQ号
+            album_id (str): 相册ID
+            pic_key (str): 照片/视频的唯一标识（来自lloc或sloc字段）
+
+        Returns:
+            str: 视频的MP4下载URL，如果获取失败则返回空字符串
+        """
+        url = self.VIDEO_DETAIL_URL_TEMPLATE.format(
+            gtk=self.qzone_g_tk,
+            t=random.random(),
+            album_id=album_id,
+            pic_key=pic_key,
+            user=self.user_qq,
+            dest_user=dest_user_qq,
+        )
+
+        if APP_CONFIG["is_api_debug"]:
+            print(f"正在获取视频详情: {url}")
+
+        data = self._access_qzone_api(url)
+
+        if APP_CONFIG["is_api_debug"]:
+            print(f"视频详情 API 响应: {json.dumps(data, indent=2, ensure_ascii=False)[:500]}")
+
+        if not data or not data.get("data"):
+            print(f"获取视频详情失败，pic_key: {pic_key}")
+            return ""
+
+        # 解析响应，查找视频下载URL
+        try:
+            photos = data["data"].get("photos", [])
+            if not photos:
+                print(f"视频详情响应中没有找到photos数据")
+                return ""
+
+            # 通过picKey匹配找到正确的视频
+            photo_data = None
+            for photo in photos:
+                # 匹配picKey或lloc字段
+                if photo.get("picKey") == pic_key or photo.get("lloc") == pic_key:
+                    photo_data = photo
+                    break
+
+            # 如果没有匹配到，尝试查找第一个视频
+            if not photo_data:
+                for photo in photos:
+                    if photo.get("is_video") or photo.get("video_info"):
+                        photo_data = photo
+                        break
+
+            # 仍然没有找到，使用第一个
+            if not photo_data:
+                photo_data = photos[0]
+
+            video_info = photo_data.get("video_info", {})
+
+            if not video_info:
+                print(f"照片数据中没有video_info字段，is_video={photo_data.get('is_video')}")
+                return ""
+
+            # 优先使用download_url（MP4格式）
+            download_url = video_info.get("download_url", "")
+            if download_url:
+                print(f"成功获取视频下载URL: {download_url[:100]}...")
+                return download_url
+
+            # 如果没有download_url，尝试使用video_url（m3u8格式，暂不支持）
+            video_url = video_info.get("video_url", "")
+            if video_url:
+                print(f"警告: 仅找到m3u8格式的视频URL，当前版本暂不支持下载")
+                return ""
+
+            print(f"video_info中没有可用的下载URL")
+            return ""
+
+        except Exception as e:
+            print(f"解析视频详情时出错: {e}")
+            return ""
 
     def get_albums_by_page(self, dest_user_qq: str) -> list[QzoneAlbum]:
         """分页获取相册列表。
@@ -758,6 +877,9 @@ class QzonePhotoManager:
                         )
                     continue
 
+                # 获取pic_key（用于视频详情查询）
+                pic_key = photo_data.get("lloc") or photo_data.get("sloc") or ""
+
                 photos.append(
                     QzonePhoto(
                         url=pic_url,
@@ -769,6 +891,7 @@ class QzonePhotoManager:
                             photo_data.get("is_video", False)
                             or photo_data.get("phototype") == "video"
                         ),  # 判断是否为视频
+                        pic_key=pic_key,  # 添加pic_key字段
                     )
                 )
 
@@ -838,6 +961,9 @@ class QzonePhotoManager:
                         album.name,
                         photo_idx,
                         photo_item,
+                        self,  # 传递qzone_manager实例，用于调用get_video_download_url
+                        album.uid,  # 传递相册ID
+                        dest_user_qq  # 传递目标用户QQ
                     )
                 )
 
