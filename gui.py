@@ -88,7 +88,7 @@ USER_CONFIG = {
 }
 
 QzoneAlbum = namedtuple("QzoneAlbum", ["uid", "name", "count"])
-QzonePhoto = namedtuple("QzonePhoto", ["url", "name", "album_name", "is_video"])
+QzonePhoto = namedtuple("QzonePhoto", ["url", "name", "album_name", "is_video", "pic_key"])
 
 
 def get_script_directory() -> str:
@@ -170,10 +170,10 @@ def download_photo_network_helper(
 
 def save_photo_worker(args: tuple) -> None:
     """
-    工作函数，用于下载并保存单张照片。
+    工作函数，用于下载并保存单张照片或视频。
     在线程池中运行。
     """
-    session, user_qq, album_index, album_name, photo_index, photo, log_signal, progress_signal, is_stopped_func = args
+    session, user_qq, album_index, album_name, photo_index, photo, log_signal, progress_signal, is_stopped_func, qzone_manager, album_id, dest_user_qq = args
 
     if is_stopped_func():
         log_signal.emit(f"[停止] 照片下载任务已停止，跳过：相册 '{album_name}', 照片 {photo_index + 1}")
@@ -194,10 +194,29 @@ def save_photo_worker(args: tuple) -> None:
 
     photo_name_sanitized = sanitize_filename_component(photo.name)
     base_filename = f"{photo_index}_{photo_name_sanitized}"
-    if photo.is_video:
-        base_filename = f"{photo_index}_{photo_name_sanitized}_视频缩略图"
 
-    final_filename = f"{base_filename}.jpeg"
+    # 如果是视频，尝试获取真实的视频下载URL
+    download_url = photo.url
+    file_extension = ".jpeg"
+
+    if photo.is_video:
+        log_signal.emit(f"[检测到视频] 正在获取真实视频下载链接: '{photo.name}'")
+        logger.info(f"[检测到视频] 正在获取真实视频下载链接: '{photo.name}'")
+
+        # 调用API获取视频下载URL
+        video_url = qzone_manager.get_video_download_url(dest_user_qq, album_id, photo.pic_key)
+
+        if video_url:
+            download_url = video_url
+            file_extension = ".mp4"
+            log_signal.emit(f"[成功] 获取到视频下载链接")
+            logger.info(f"[成功] 获取到视频下载链接")
+        else:
+            log_signal.emit(f"[失败] 无法获取视频下载链接，将下载视频封面图代替")
+            logger.warning(f"[失败] 无法获取视频下载链接，将下载视频封面图代替: {photo.name}")
+            base_filename = f"{photo_index}_{photo_name_sanitized}_视频封面"
+
+    final_filename = f"{base_filename}{file_extension}"
     full_photo_path = os.path.join(album_save_path, final_filename)
 
     if not is_path_valid(full_photo_path):
@@ -219,12 +238,13 @@ def save_photo_worker(args: tuple) -> None:
         progress_signal.emit(1)
         return
 
-    url = photo.url.replace("\\", "")
+    url = download_url.replace("\\", "")
     attempts = 0
     current_timeout = APP_CONFIG["timeout_init"]
 
-    log_signal.emit(f"[开始下载] 相册 '{album_name}', 照片 {photo_index + 1} ('{photo.name}')")
-    logger.info(f"[开始下载] 相册 '{album_name}', 照片 {photo_index + 1} ('{photo.name}')")
+    download_type = "视频" if photo.is_video and file_extension == ".mp4" else "照片"
+    log_signal.emit(f"[开始下载] 相册 '{album_name}', {download_type} {photo_index + 1} ('{photo.name}')")
+    logger.info(f"[开始下载] 相册 '{album_name}', {download_type} {photo_index + 1} ('{photo.name}')")
 
     while attempts < APP_CONFIG["max_attempts"]:
         if is_stopped_func():
@@ -310,6 +330,16 @@ class QzonePhotoManager:
         "&skipCmtCount=0&singleurl=1&batchId=&notice=0&appid=4&inCharset=utf-8&outCharset=utf-8"
         "&source=qzone&plat=qzone&outstyle=json&format=jsonp&json_esc=1&question=&answer="
         "&callbackFun=shine0&callback=shine0_Callback"
+    )
+
+    # 获取视频详情的API URL模板
+    VIDEO_DETAIL_URL_TEMPLATE = (
+        "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/"
+        "cgi_floatview_photo_list_v2?g_tk={gtk}&t={t}&topicId={album_id}&picKey={pic_key}"
+        "&shootTime=&cmtOrder=1&fupdate=1&plat=qzone&source=qzone&cmtNum=10&likeNum=5"
+        "&inCharset=utf-8&outCharset=utf-8&callbackFun=viewer&offset=0&number=15"
+        "&uin={user}&hostUin={dest_user}&appid=4&isFirst=1&sortOrder=1&showMode=1"
+        "&need_private_comment=1&prevNum=9&postNum=18"
     )
 
     def __init__(self, user_qq: str, log_signal=None, is_stopped_func=None):
@@ -532,19 +562,28 @@ class QzonePhotoManager:
             return {}
 
         text_content = response.text
+        # 支持多种JSONP回调格式
         if text_content.startswith("shine0_Callback(") and text_content.endswith(");"):
             json_str = text_content[len("shine0_Callback(") : -2]
+        elif text_content.startswith("viewer_Callback(") and text_content.endswith(");"):
+            json_str = text_content[len("viewer_Callback(") : -2]
         elif text_content.startswith("_Callback(") and text_content.endswith(");"):
             json_str = text_content[len("_Callback(") : -2]
         else:
-            if APP_CONFIG["is_api_debug"]:
-                self._emit_log(
-                    f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
-                )
-                logger.warning(
-                    f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
-                )
-            json_str = text_content
+            # 尝试使用正则表达式匹配任意回调函数名
+            import re
+            match = re.match(r'^\w+_Callback\((.*)\);?$', text_content, re.DOTALL)
+            if match:
+                json_str = match.group(1)
+            else:
+                if APP_CONFIG["is_api_debug"]:
+                    self._emit_log(
+                        f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
+                    )
+                    logger.warning(
+                        f"意外的 API 响应格式 (没有已知的 JSONP 包装器): {text_content[:200]}"
+                    )
+                json_str = text_content
 
         try:
             return json.loads(json_str)
@@ -555,6 +594,99 @@ class QzonePhotoManager:
                 self._emit_log(f"有问题的完整 JSON 字符串: {json_str}")
                 logger.debug(f"有问题的完整 JSON 字符串: {json_str}")
             return {}
+
+    def get_video_download_url(self, dest_user_qq: str, album_id: str, pic_key: str) -> str:
+        """
+        获取视频的真实下载URL。
+
+        Args:
+            dest_user_qq (str): 目标用户的QQ号
+            album_id (str): 相册ID
+            pic_key (str): 照片/视频的唯一标识（来自lloc或sloc字段）
+
+        Returns:
+            str: 视频的MP4下载URL，如果获取失败则返回空字符串
+        """
+        url = self.VIDEO_DETAIL_URL_TEMPLATE.format(
+            gtk=self.qzone_g_tk,
+            t=random.random(),
+            album_id=album_id,
+            pic_key=pic_key,
+            user=self.user_qq,
+            dest_user=dest_user_qq,
+        )
+
+        if APP_CONFIG["is_api_debug"]:
+            self._emit_log(f"正在获取视频详情: {url}")
+            logger.debug(f"正在获取视频详情: {url}")
+
+        data = self._access_qzone_api(url)
+
+        if APP_CONFIG["is_api_debug"]:
+            self._emit_log(f"视频详情 API 响应: {json.dumps(data, indent=2, ensure_ascii=False)[:500]}")
+            logger.debug(f"视频详情 API 响应: {json.dumps(data, indent=2, ensure_ascii=False)}")
+
+        if not data or not data.get("data"):
+            self._emit_log(f"获取视频详情失败，pic_key: {pic_key}")
+            logger.warning(f"获取视频详情失败，pic_key: {pic_key}")
+            return ""
+
+        # 解析响应，查找视频下载URL
+        try:
+            photos = data["data"].get("photos", [])
+            if not photos:
+                self._emit_log(f"视频详情响应中没有找到photos数据")
+                logger.warning(f"视频详情响应中没有找到photos数据")
+                return ""
+
+            # 通过picKey匹配找到正确的视频
+            photo_data = None
+            for photo in photos:
+                # 匹配picKey或lloc字段
+                if photo.get("picKey") == pic_key or photo.get("lloc") == pic_key:
+                    photo_data = photo
+                    break
+
+            # 如果没有匹配到，尝试查找第一个视频
+            if not photo_data:
+                for photo in photos:
+                    if photo.get("is_video") or photo.get("video_info"):
+                        photo_data = photo
+                        break
+
+            # 仍然没有找到，使用第一个
+            if not photo_data:
+                photo_data = photos[0]
+
+            video_info = photo_data.get("video_info", {})
+
+            if not video_info:
+                self._emit_log(f"照片数据中没有video_info字段，is_video={photo_data.get('is_video')}")
+                logger.warning(f"照片数据中没有video_info字段: {photo_data.get('name', 'unknown')}, picKey={photo_data.get('picKey', 'N/A')}")
+                return ""
+
+            # 优先使用download_url（MP4格式）
+            download_url = video_info.get("download_url", "")
+            if download_url:
+                self._emit_log(f"成功获取视频下载URL: {download_url[:100]}...")
+                logger.info(f"成功获取视频下载URL")
+                return download_url
+
+            # 如果没有download_url，尝试使用video_url（m3u8格式，暂不支持）
+            video_url = video_info.get("video_url", "")
+            if video_url:
+                self._emit_log(f"警告: 仅找到m3u8格式的视频URL，当前版本暂不支持下载")
+                logger.warning(f"仅找到m3u8格式的视频URL: {video_url}")
+                return ""
+
+            self._emit_log(f"video_info中没有可用的下载URL")
+            logger.warning(f"video_info中没有可用的下载URL: {video_info}")
+            return ""
+
+        except Exception as e:
+            self._emit_log(f"解析视频详情时出错: {e}")
+            logger.exception(f"解析视频详情时出错")
+            return ""
 
     def get_albums_by_page(self, dest_user_qq: str) -> list[QzoneAlbum]:
         pageStart = 0
@@ -743,6 +875,9 @@ class QzonePhotoManager:
                         )
                     continue
 
+                # 获取pic_key（用于视频详情查询）
+                pic_key = photo_data.get("lloc") or photo_data.get("sloc") or ""
+
                 photos.append(
                     QzonePhoto(
                         url=pic_url,
@@ -754,6 +889,7 @@ class QzonePhotoManager:
                             photo_data.get("is_video", False)
                             or photo_data.get("phototype") == "video"
                         ),
+                        pic_key=pic_key,
                     )
                 )
 
@@ -841,7 +977,10 @@ class QzonePhotoManager:
                         photo_item,
                         self.log_signal,
                         progress_signal,
-                        self.is_stopped_func
+                        self.is_stopped_func,
+                        self,  # 传递qzone_manager实例，用于调用get_video_download_url
+                        album.uid,  # 传递相册ID
+                        dest_user_qq  # 传递目标用户QQ
                     )
                 )
 
